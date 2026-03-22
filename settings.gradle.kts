@@ -19,6 +19,7 @@ include(
     "Nebula",
     "SimklProvider",
     "StreamingCommunity",
+    "StreamSports99",
     "TV",
     "Torrentio",
     "YouTube"
