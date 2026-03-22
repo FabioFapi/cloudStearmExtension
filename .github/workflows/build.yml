@@ -12,6 +12,7 @@ on:
       # choose your default branch
       - master
       - main
+      - claude/**
     paths-ignore:
       - '*.md'
       - '*.png'
