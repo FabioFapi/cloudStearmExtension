@@ -20,7 +20,6 @@ import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newSearchResponseList
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
-import com.lagradost.cloudstream3.utils.loadExtractor
 import org.schabi.newpipe.extractor.InfoItem
 import org.schabi.newpipe.extractor.InfoItem.InfoType
 import org.schabi.newpipe.extractor.Page
@@ -291,6 +290,43 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        return loadExtractor(data, null, subtitleCallback, callback)
+        val extractor = service.getStreamExtractor(data)
+        extractor.fetchPage()
+        val videoInfo = StreamInfo.getInfo(extractor)
+
+        var found = false
+
+        // Progressive streams (video + audio combined)
+        videoInfo.videoStreams.forEach { stream ->
+            val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
+            callback(
+                ExtractorLink(
+                    source = name,
+                    name = "$name ${stream.resolution}",
+                    url = stream.content,
+                    referer = MAIN_URL,
+                    quality = quality,
+                    isM3u8 = false
+                )
+            )
+            found = true
+        }
+
+        // HLS (live streams)
+        if (videoInfo.hlsUrl.isNotEmpty()) {
+            callback(
+                ExtractorLink(
+                    source = name,
+                    name = "$name Live",
+                    url = videoInfo.hlsUrl,
+                    referer = MAIN_URL,
+                    quality = -1,
+                    isM3u8 = true
+                )
+            )
+            found = true
+        }
+
+        return found
     }
 }
