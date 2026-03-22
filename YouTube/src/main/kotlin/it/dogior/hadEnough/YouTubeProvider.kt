@@ -15,6 +15,8 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
@@ -297,17 +299,18 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
         var found = false
 
         // Progressive streams (video + audio combined)
-        videoInfo.videoStreams.forEach { stream ->
+        for (stream in videoInfo.videoStreams) {
             val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     source = name,
                     name = "$name ${stream.resolution}",
                     url = stream.content,
-                    referer = MAIN_URL,
-                    quality = quality,
-                    isM3u8 = false
-                )
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = MAIN_URL
+                    this.quality = quality
+                }
             )
             found = true
         }
@@ -315,14 +318,15 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
         // HLS (live streams)
         if (videoInfo.hlsUrl.isNotEmpty()) {
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     source = name,
                     name = "$name Live",
                     url = videoInfo.hlsUrl,
-                    referer = MAIN_URL,
-                    quality = -1,
-                    isM3u8 = true
-                )
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = MAIN_URL
+                    this.quality = -1
+                }
             )
             found = true
         }
