@@ -21,17 +21,21 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@master
         with:
           path: "src"
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout builds
         uses: actions/checkout@master
         with:
           ref: "builds"
           path: "builds"
+          token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Clean old builds
         run: rm -f $GITHUB_WORKSPACE/builds/*.cs3
