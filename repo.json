@@ -2,7 +2,7 @@
   "name": "FabioFapi's Extensions",
   "iconUrl": "https://raw.githubusercontent.com/FabioFapi/cloudStearmExtension/master/repo_icon.png",
   "description": "Repository con provider italiani e internazionali",
-  "manifestVersion": 1,
+  "manifestVersion": 2,
   "pluginLists": [
     "https://raw.githubusercontent.com/FabioFapi/cloudStearmExtension/builds/plugins.json"
   ]
