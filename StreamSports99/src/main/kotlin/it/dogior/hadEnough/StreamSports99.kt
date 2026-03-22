@@ -14,6 +14,7 @@ import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.mainPageOf
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newLiveSearchResponse
 import com.lagradost.cloudstream3.newLiveStreamLoadResponse
@@ -22,6 +23,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.jsoup.nodes.Element
 
 class StreamSports99 : MainAPI() {
@@ -33,20 +36,27 @@ class StreamSports99 : MainAPI() {
     override val hasDownloadSupport = false
     override val hasChromecastSupport = true
 
+    // Shared CloudflareKiller instance – bypasses Cloudflare JS challenges on Android
+    private val cfKiller = CloudflareKiller()
+
     companion object {
         private const val USER_AGENT =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
-        // Matches /player/soccer-bNwf86oU style URLs
-        private val PLAYER_URL_REGEX = Regex("""/player/([a-zA-Z]+(?:-[a-zA-Z]+)*)-([a-zA-Z0-9]{6,12})(?=[^-a-zA-Z0-9]|$)""")
+        // Matches /player/soccer-bNwf86oU (sport prefix + 6-12 char alphanumeric id)
+        private val PLAYER_URL_REGEX =
+            Regex("""/player/([a-zA-Z]+(?:-[a-zA-Z]+)*)-([a-zA-Z0-9]{6,12})(?=[^-a-zA-Z0-9]|$)""")
 
-        // Potential API endpoints to try
-        private val API_ENDPOINTS = listOf(
+        // Static list of candidate REST API paths (tried in order)
+        private val CANDIDATE_API_PATHS = listOf(
             "/api/events",
             "/api/matches",
             "/api/schedule",
             "/api/live",
             "/api/v1/events",
+            "/api/v2/events",
+            "/schedule",
+            "/events",
         )
     }
 
@@ -55,7 +65,8 @@ class StreamSports99 : MainAPI() {
         "Accept-Language" to "en-US,en;q=0.9",
     )
 
-    // Data classes for JSON API responses (covers common patterns)
+    // ── Data classes ──────────────────────────────────────────────────────────
+
     data class ApiEvent(
         @JsonProperty("id") val id: String? = null,
         @JsonProperty("slug") val slug: String? = null,
@@ -71,13 +82,12 @@ class StreamSports99 : MainAPI() {
         @JsonProperty("url") val url: String? = null,
         @JsonProperty("link") val link: String? = null,
         @JsonProperty("status") val status: String? = null,
-        @JsonProperty("time") val time: String? = null,
         @JsonProperty("thumbnail") val thumbnail: String? = null,
         @JsonProperty("poster") val poster: String? = null,
     ) {
         fun toPlayerUrl(baseUrl: String): String? {
-            url?.let { if (it.startsWith("http")) return it else return "$baseUrl$it" }
-            link?.let { if (it.startsWith("http")) return it else return "$baseUrl$it" }
+            url?.let { return if (it.startsWith("http")) it else "$baseUrl$it" }
+            link?.let { return if (it.startsWith("http")) it else "$baseUrl$it" }
             slug?.let { return "$baseUrl/player/$it" }
             val sportSlug = (sport ?: category)?.lowercase()?.replace(" ", "-")
             id?.let { if (sportSlug != null) return "$baseUrl/player/$sportSlug-$it" }
@@ -108,32 +118,54 @@ class StreamSports99 : MainAPI() {
             data ?: events ?: matches ?: results ?: emptyList()
     }
 
-    // --- API-based fetching ---
+    data class StreamApiResponse(
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("stream") val stream: String? = null,
+        @JsonProperty("src") val src: String? = null,
+        @JsonProperty("file") val file: String? = null,
+        @JsonProperty("hls") val hls: String? = null,
+    )
 
+    // ── CloudflareKiller for video streams ────────────────────────────────────
+
+    override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
+        return object : Interceptor {
+            override fun intercept(chain: Interceptor.Chain): Response =
+                cfKiller.intercept(chain)
+        }
+    }
+
+    // ── API-based event fetching ──────────────────────────────────────────────
+
+    /**
+     * Tries all candidate REST API paths. Returns null if none works.
+     */
     private suspend fun fetchEventsFromApi(filter: String? = null): List<LiveSearchResponse>? {
-        for (endpoint in API_ENDPOINTS) {
+        val apiHeaders = baseHeaders + mapOf(
+            "Accept" to "application/json",
+            "X-Requested-With" to "XMLHttpRequest",
+            "Referer" to mainUrl,
+        )
+
+        // Also try any API paths discovered from the JS bundle
+        val dynamicPaths = discoverApiPathsFromBundle()
+        val allPaths = (CANDIDATE_API_PATHS + dynamicPaths).distinct()
+
+        for (path in allPaths) {
             try {
-                val url = if (filter != null) "$mainUrl$endpoint?status=$filter" else "$mainUrl$endpoint"
-                val resp = app.get(
-                    url,
-                    headers = baseHeaders + mapOf(
-                        "Accept" to "application/json",
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Referer" to mainUrl,
-                    )
-                )
+                val url = "$mainUrl$path" + (if (filter != null) "?status=$filter" else "")
+                val resp = app.get(url, headers = apiHeaders, interceptor = cfKiller)
                 if (resp.code != 200) continue
                 val ct = resp.headers["content-type"] ?: ""
                 if (!ct.contains("json")) continue
 
                 val text = resp.text
-                // Try as wrapped response first, then as plain list
                 val apiResp = tryParseJson<ApiResponse>(text)
                 val events = apiResp?.allEvents()?.takeIf { it.isNotEmpty() }
                     ?: tryParseJson<List<ApiEvent>>(text)?.takeIf { it.isNotEmpty() }
                     ?: continue
 
-                Log.d("StreamSports99", "API $endpoint returned ${events.size} events")
+                Log.d("StreamSports99", "API $path: ${events.size} events")
                 return events.mapNotNull { event ->
                     val playerUrl = event.toPlayerUrl(mainUrl) ?: return@mapNotNull null
                     newLiveSearchResponse(event.toDisplayName(), playerUrl, TvType.Live) {
@@ -141,92 +173,107 @@ class StreamSports99 : MainAPI() {
                     }
                 }
             } catch (e: Exception) {
-                Log.d("StreamSports99", "API endpoint failed ($endpoint): ${e.message}")
+                Log.d("StreamSports99", "API $path failed: ${e.message}")
             }
         }
         return null
     }
 
-    // --- HTML-based fetching ---
+    /**
+     * Fetches the homepage HTML (bypassing Cloudflare), then scans the main JS
+     * bundle for `/api/...` strings to discover unknown API paths dynamically.
+     */
+    private var cachedApiPaths: List<String>? = null
+
+    private suspend fun discoverApiPathsFromBundle(): List<String> {
+        cachedApiPaths?.let { return it }
+        return try {
+            val doc = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller).document
+            // Collect all JS script sources (skip tiny inline scripts)
+            val scriptSrcs = doc.select("script[src]").map { it.attr("src") }
+                .filter { it.endsWith(".js") && "polyfill" !in it }
+                .map { if (it.startsWith("http")) it else "$mainUrl$it" }
+                .take(8)
+
+            val foundPaths = mutableListOf<String>()
+            val apiPathRegex = Regex("""["'](/api/[a-zA-Z0-9/_-]{2,40})["']""")
+
+            for (src in scriptSrcs) {
+                try {
+                    val js = app.get(src, headers = baseHeaders, interceptor = cfKiller).text
+                    apiPathRegex.findAll(js).forEach { m ->
+                        val p = m.groupValues[1]
+                        if (!foundPaths.contains(p)) foundPaths.add(p)
+                    }
+                } catch (_: Exception) {}
+            }
+
+            Log.d("StreamSports99", "Discovered API paths from bundle: $foundPaths")
+            cachedApiPaths = foundPaths
+            foundPaths
+        } catch (e: Exception) {
+            Log.d("StreamSports99", "Bundle discovery failed: ${e.message}")
+            emptyList()
+        }
+    }
+
+    // ── HTML-based event fetching ─────────────────────────────────────────────
 
     private fun buildEventName(sport: String, card: Element?): String {
         if (card == null) return sport.replaceFirstChar { it.uppercase() }
 
-        // Try to find league/competition name
         val league = card.select(
             "[class*='league'],[class*='competition'],[class*='category'],[class*='tournament']"
         ).firstOrNull()?.text()?.takeIf { it.isNotBlank() }
 
-        // Try to find team names (skip very short or badge-like texts)
         val teamTexts = card.select(
             "[class*='team'],[class*='name'],[class*='home'],[class*='away']"
         ).map { it.text().trim() }.filter { it.length > 2 }
 
-        val sportTitle = sport.replaceFirstChar { it.uppercase() }
-
         return buildString {
-            append(sportTitle)
+            append(sport.replaceFirstChar { it.uppercase() })
             if (league != null) append(" | $league")
-            if (teamTexts.size >= 2) {
-                append(" | ${teamTexts[0]} vs ${teamTexts[1]}")
-            } else if (teamTexts.isNotEmpty()) {
-                append(" | ${teamTexts[0]}")
-            }
+            if (teamTexts.size >= 2) append(" | ${teamTexts[0]} vs ${teamTexts[1]}")
+            else if (teamTexts.isNotEmpty()) append(" | ${teamTexts[0]}")
         }
     }
 
     private suspend fun fetchEventsFromHtml(): List<LiveSearchResponse> {
-        val doc = app.get(mainUrl, headers = baseHeaders).document
+        val doc = app.get(mainUrl, headers = baseHeaders, interceptor = cfKiller).document
         val events = mutableListOf<LiveSearchResponse>()
         val seen = mutableSetOf<String>()
 
-        // Strategy 1: direct <a href="/player/..."> links
-        doc.select("a[href*='/player/']").forEach { anchor ->
-            val href = anchor.attr("href").let {
-                if (it.startsWith("http")) it else "$mainUrl$it"
-            }
-            if (seen.add(href)) {
-                val match = PLAYER_URL_REGEX.find(href) ?: return@forEach
-                val sport = match.groupValues[1]
-                val card = anchor.closest(
-                    "article,li,[class*='card'],[class*='match'],[class*='event'],[class*='game'],[class*='item']"
-                )
-                val displayName = buildEventName(sport, card ?: anchor.parent())
-                events.add(newLiveSearchResponse(displayName, href, TvType.Live))
-            }
+        fun addFromHref(href: String, contextEl: Element?) {
+            val full = if (href.startsWith("http")) href else "$mainUrl$href"
+            if (!seen.add(full)) return
+            val m = PLAYER_URL_REGEX.find(full) ?: return
+            val sport = m.groupValues[1]
+            val card = contextEl?.closest(
+                "article,li,[class*='card'],[class*='match'],[class*='event'],[class*='game'],[class*='item']"
+            )
+            events.add(newLiveSearchResponse(buildEventName(sport, card ?: contextEl), full, TvType.Live))
         }
 
-        // Strategy 2: data-* attributes containing player URLs
-        if (events.isEmpty()) {
-            doc.select("[data-url*='/player/'],[data-href*='/player/'],[data-link*='/player/']")
-                .forEach { el ->
-                    val href = (el.attr("data-url").ifEmpty { el.attr("data-href") }
-                        .ifEmpty { el.attr("data-link") }).let {
-                        if (it.startsWith("http")) it else "$mainUrl$it"
-                    }
-                    if (seen.add(href)) {
-                        val match = PLAYER_URL_REGEX.find(href) ?: return@forEach
-                        val sport = match.groupValues[1]
-                        val card = el.closest(
-                            "article,li,[class*='card'],[class*='match'],[class*='event'],[class*='game']"
-                        )
-                        val displayName = buildEventName(sport, card ?: el.parent())
-                        events.add(newLiveSearchResponse(displayName, href, TvType.Live))
-                    }
-                }
-        }
+        // 1. <a href="/player/...">
+        doc.select("a[href*='/player/']").forEach { addFromHref(it.attr("href"), it) }
 
-        // Strategy 3: scan raw HTML for player URLs (catches JS-embedded links)
+        // 2. data-url / data-href / data-link attributes
+        doc.select("[data-url*='/player/'],[data-href*='/player/'],[data-link*='/player/']")
+            .forEach { el ->
+                val href = el.attr("data-url").ifEmpty { el.attr("data-href") }
+                    .ifEmpty { el.attr("data-link") }
+                addFromHref(href, el)
+            }
+
+        // 3. Raw HTML scan (catches URLs inside inline JS / JSON)
         if (events.isEmpty()) {
-            PLAYER_URL_REGEX.findAll(doc.html()).forEach { match ->
-                val playerPath = match.value
-                val href = "$mainUrl$playerPath"
-                if (seen.add(href)) {
-                    val sport = match.groupValues[1]
+            PLAYER_URL_REGEX.findAll(doc.html()).forEach { m ->
+                val full = "$mainUrl${m.value}"
+                if (seen.add(full)) {
                     events.add(
                         newLiveSearchResponse(
-                            sport.replaceFirstChar { it.uppercase() },
-                            href,
+                            m.groupValues[1].replaceFirstChar { it.uppercase() },
+                            full,
                             TvType.Live
                         )
                     )
@@ -234,21 +281,20 @@ class StreamSports99 : MainAPI() {
             }
         }
 
-        // Strategy 4: try Next.js __NEXT_DATA__ or Nuxt __NUXT__ embedded JSON
+        // 4. Next.js __NEXT_DATA__ / Nuxt __NUXT__ embedded JSON
         if (events.isEmpty()) {
-            val nextData = doc.selectFirst("script#__NEXT_DATA__")?.data()
-                ?: doc.select("script").firstOrNull { it.data().contains("__NUXT__") }?.data()
+            val embeddedJson = doc.selectFirst("script#__NEXT_DATA__")?.data()
+                ?: doc.select("script").firstOrNull { "__NUXT__" in it.data() }?.data()
                     ?.substringAfter("=", "")?.trim()?.trimEnd(';')
 
-            if (nextData != null) {
-                PLAYER_URL_REGEX.findAll(nextData).forEach { match ->
-                    val href = "$mainUrl${match.value}"
-                    if (seen.add(href)) {
-                        val sport = match.groupValues[1]
+            embeddedJson?.let { json ->
+                PLAYER_URL_REGEX.findAll(json).forEach { m ->
+                    val full = "$mainUrl${m.value}"
+                    if (seen.add(full)) {
                         events.add(
                             newLiveSearchResponse(
-                                sport.replaceFirstChar { it.uppercase() },
-                                href,
+                                m.groupValues[1].replaceFirstChar { it.uppercase() },
+                                full,
                                 TvType.Live
                             )
                         )
@@ -257,11 +303,11 @@ class StreamSports99 : MainAPI() {
             }
         }
 
-        Log.d("StreamSports99", "HTML scrape: found ${events.size} events")
+        Log.d("StreamSports99", "HTML scrape: ${events.size} events found")
         return events
     }
 
-    // ---- Main page ----
+    // ── Main page ─────────────────────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
         "$mainUrl?filter=live" to "Live",
@@ -270,7 +316,6 @@ class StreamSports99 : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Determine filter from request data URL
         val filter = when {
             request.data.contains("filter=live") -> "live"
             request.data.contains("filter=upcoming") -> "upcoming"
@@ -278,8 +323,7 @@ class StreamSports99 : MainAPI() {
         }
 
         val events: List<LiveSearchResponse> =
-            fetchEventsFromApi(filter)
-                ?: fetchEventsFromHtml()
+            fetchEventsFromApi(filter) ?: fetchEventsFromHtml()
 
         return newHomePageResponse(
             HomePageList(request.name, events, isHorizontalImages = false),
@@ -287,30 +331,26 @@ class StreamSports99 : MainAPI() {
         )
     }
 
-    // ---- Search ----
+    // ── Search ────────────────────────────────────────────────────────────────
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val allEvents: List<LiveSearchResponse> =
-            fetchEventsFromApi() ?: fetchEventsFromHtml()
-        return allEvents.filter {
-            query.lowercase() in it.name.lowercase()
-        }
+        val all = fetchEventsFromApi() ?: fetchEventsFromHtml()
+        return all.filter { query.lowercase() in it.name.lowercase() }
     }
 
-    // ---- Load ----
+    // ── Load ──────────────────────────────────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse {
         val headers = baseHeaders + mapOf("Referer" to mainUrl)
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = headers, interceptor = cfKiller).document
 
         val ogTitle = doc.selectFirst("meta[property='og:title']")?.attr("content")
         val h1 = doc.selectFirst("h1,h2")?.text()
         val pageTitle = doc.selectFirst("title")?.text()
             ?.substringBefore(" - ")?.substringBefore(" | ")?.trim()
 
-        val title = (ogTitle ?: h1 ?: pageTitle
-            ?: url.substringAfterLast("/player/")).trim()
-            .ifBlank { url.substringAfterLast("/player/") }
+        val title = (ogTitle ?: h1 ?: pageTitle ?: url.substringAfterLast("/player/"))
+            .trim().ifBlank { url.substringAfterLast("/player/") }
 
         val posterUrl = doc.selectFirst("meta[property='og:image']")?.attr("content")
             ?: doc.selectFirst("meta[name='twitter:image']")?.attr("content")
@@ -324,7 +364,7 @@ class StreamSports99 : MainAPI() {
         }
     }
 
-    // ---- Load links ----
+    // ── Load links ────────────────────────────────────────────────────────────
 
     override suspend fun loadLinks(
         data: String,
@@ -333,14 +373,14 @@ class StreamSports99 : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val refHeaders = baseHeaders + mapOf("Referer" to mainUrl)
-        val doc = app.get(data, headers = refHeaders).document
+        val doc = app.get(data, headers = refHeaders, interceptor = cfKiller).document
         val pageHtml = doc.html()
         val scripts = doc.select("script").joinToString("\n") { it.data() }
         var found = false
 
         Log.d("StreamSports99", "loadLinks: $data")
 
-        // 1. Iframes (most common embed pattern for streaming sites)
+        // 1. Iframes
         doc.select("iframe[src],iframe[data-src]").forEach { iframe ->
             val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
             if (src.isNotEmpty() && !src.startsWith("javascript") && src != "about:blank") {
@@ -349,7 +389,7 @@ class StreamSports99 : MainAPI() {
                     src.startsWith("http") -> src
                     else -> fixUrl(src)
                 }
-                Log.d("StreamSports99", "Iframe found: $fullSrc")
+                Log.d("StreamSports99", "Iframe: $fullSrc")
                 try {
                     loadExtractor(fullSrc, data, subtitleCallback, callback)
                     found = true
@@ -359,108 +399,92 @@ class StreamSports99 : MainAPI() {
             }
         }
 
-        // 2. HLS (.m3u8) streams anywhere in page
+        // 2. HLS .m3u8 URLs anywhere on the page
         Regex("""https?://[^\s'"<>{}\[\]()]+\.m3u8(?:\?[^\s'"<>{}\[\]()]*)?""")
             .findAll(pageHtml).forEach { m ->
-                val u = m.value.trim('"', '\'')
-                Log.d("StreamSports99", "HLS: $u")
-                callback(
-                    newExtractorLink(name, name, u, ExtractorLinkType.M3U8) {
-                        quality = 0; referer = data; headers = refHeaders
-                    }
-                )
+                callback(newExtractorLink(name, name, m.value, ExtractorLinkType.M3U8) {
+                    quality = 0; referer = data; headers = refHeaders
+                })
                 found = true
             }
 
-        // 3. DASH (.mpd) streams anywhere in page
+        // 3. DASH .mpd URLs anywhere on the page
         Regex("""https?://[^\s'"<>{}\[\]()]+\.mpd(?:\?[^\s'"<>{}\[\]()]*)?""")
             .findAll(pageHtml).forEach { m ->
-                val u = m.value.trim('"', '\'')
-                Log.d("StreamSports99", "DASH: $u")
-                callback(
-                    newExtractorLink(name, "$name DASH", u, ExtractorLinkType.DASH) {
-                        quality = 0; referer = data; headers = refHeaders
-                    }
-                )
+                callback(newExtractorLink(name, "$name DASH", m.value, ExtractorLinkType.DASH) {
+                    quality = 0; referer = data; headers = refHeaders
+                })
                 found = true
             }
 
-        // 4. JWPlayer / VideoJS / Plyr config in JavaScript
-        // Patterns: file:"...", src:"...", source:"..."
-        Regex("""["'](?:file|src|source|stream|url)["']\s*:\s*["'](https?://[^"']+)["']""", RegexOption.IGNORE_CASE)
-            .findAll(scripts).forEach { m ->
-                val u = m.groupValues[1]
-                val linkType = when {
-                    u.contains(".m3u8") -> ExtractorLinkType.M3U8
-                    u.contains(".mpd") -> ExtractorLinkType.DASH
-                    u.contains("stream", ignoreCase = true) || u.contains("live", ignoreCase = true) ->
-                        ExtractorLinkType.M3U8
-                    else -> return@forEach
-                }
-                Log.d("StreamSports99", "Player config stream: $u")
-                callback(
-                    newExtractorLink(name, name, u, linkType) {
-                        quality = 0; referer = data; headers = refHeaders
-                    }
-                )
-                found = true
+        // 4. JWPlayer / VideoJS / Plyr config: "file":"...", "src":"..."
+        Regex("""["'](?:file|src|source|stream|url)["']\s*:\s*["'](https?://[^"']+)["']""",
+            RegexOption.IGNORE_CASE
+        ).findAll(scripts).forEach { m ->
+            val u = m.groupValues[1]
+            val lt = when {
+                u.contains(".m3u8") -> ExtractorLinkType.M3U8
+                u.contains(".mpd") -> ExtractorLinkType.DASH
+                u.contains("stream", true) || u.contains("live", true) -> ExtractorLinkType.M3U8
+                else -> return@forEach
             }
+            Log.d("StreamSports99", "Player config: $u")
+            callback(newExtractorLink(name, name, u, lt) {
+                quality = 0; referer = data; headers = refHeaders
+            })
+            found = true
+        }
 
-        // 5. <source> tags (HTML5 video)
+        // 5. <source src="...">
         doc.select("source[src]").forEach { source ->
             val src = source.attr("src").takeIf { it.isNotEmpty() } ?: return@forEach
             val type = source.attr("type")
-            val linkType = when {
+            val lt = when {
                 src.contains(".m3u8") || type.contains("mpegurl", true) -> ExtractorLinkType.M3U8
                 src.contains(".mpd") || type.contains("dash", true) -> ExtractorLinkType.DASH
                 else -> ExtractorLinkType.VIDEO
             }
-            Log.d("StreamSports99", "<source>: $src")
-            callback(
-                newExtractorLink(name, name, fixUrl(src), linkType) {
-                    quality = 0; referer = data; headers = refHeaders
-                }
-            )
+            callback(newExtractorLink(name, name, fixUrl(src), lt) {
+                quality = 0; referer = data; headers = refHeaders
+            })
             found = true
         }
 
-        // 6. Try API endpoint for stream URL using the event ID from URL
-        // e.g. /player/soccer-bNwf86oU -> id = bNwf86oU, sport = soccer
+        // 6. Fallback: try common stream API patterns using the event ID
         if (!found) {
             val match = PLAYER_URL_REGEX.find(data)
             if (match != null) {
                 val sport = match.groupValues[1]
                 val id = match.groupValues[2]
-                val streamApiUrls = listOf(
+                val streamApis = listOf(
                     "$mainUrl/api/stream/$id",
                     "$mainUrl/api/events/$id/stream",
                     "$mainUrl/api/player/$sport-$id",
                     "$mainUrl/stream/$id",
                 )
-                for (apiUrl in streamApiUrls) {
+                for (apiUrl in streamApis) {
                     try {
                         val resp = app.get(
                             apiUrl,
-                            headers = refHeaders + mapOf("Accept" to "application/json")
+                            headers = refHeaders + mapOf("Accept" to "application/json"),
+                            interceptor = cfKiller
                         )
                         if (resp.code != 200) continue
-                        val streamData = tryParseJson<StreamApiResponse>(resp.text) ?: continue
-                        val streamUrl = streamData.url ?: streamData.stream ?: streamData.src ?: continue
-                        val linkType = when {
-                            streamUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
-                            streamUrl.contains(".mpd") -> ExtractorLinkType.DASH
+                        val sd = tryParseJson<StreamApiResponse>(resp.text) ?: continue
+                        val su = sd.url ?: sd.stream ?: sd.src ?: sd.hls ?: sd.file ?: continue
+                        val lt = when {
+                            su.contains(".m3u8") -> ExtractorLinkType.M3U8
+                            su.contains(".mpd") -> ExtractorLinkType.DASH
                             else -> ExtractorLinkType.VIDEO
                         }
-                        Log.d("StreamSports99", "Stream API: $streamUrl")
-                        callback(
-                            newExtractorLink(name, name, streamUrl, linkType) {
-                                quality = 0; referer = data; headers = refHeaders
-                            }
-                        )
+                        Log.d("StreamSports99", "Stream API: $su")
+                        callback(newExtractorLink(name, name, su, lt) {
+                            quality = 0; referer = data; headers = refHeaders
+                        })
                         found = true
                         break
                     } catch (e: Exception) {
-                        Log.d("StreamSports99", "Stream API failed ($apiUrl): ${e.message}")
+                        Log.d("StreamSports99", "Stream API ($apiUrl) failed: ${e.message}")
                     }
                 }
             }
@@ -468,12 +492,4 @@ class StreamSports99 : MainAPI() {
 
         return found
     }
-
-    data class StreamApiResponse(
-        @JsonProperty("url") val url: String? = null,
-        @JsonProperty("stream") val stream: String? = null,
-        @JsonProperty("src") val src: String? = null,
-        @JsonProperty("file") val file: String? = null,
-        @JsonProperty("hls") val hls: String? = null,
-    )
 }
