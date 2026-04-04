@@ -364,15 +364,16 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
     }
 
     private suspend fun loadLinksViaInnerTube(videoId: String, callback: (ExtractorLink) -> Unit): Boolean {
-        // Android client — not blocked by YouTube's bot detection
-        val body = """{"context":{"client":{"clientName":"ANDROID","clientVersion":"19.09.37","androidSdkVersion":30,"hl":"en","gl":"US"}},"videoId":"$videoId","params":"2AMB"}"""
+        val clientVersion = "19.44.38"
+        val body = """{"context":{"client":{"clientName":"ANDROID","clientVersion":"$clientVersion","androidSdkVersion":30,"hl":"en","gl":"US","timeZone":"UTC","utcOffsetMinutes":0}},"videoId":"$videoId"}"""
         val response = app.post(
-            "https://www.youtube.com/youtubei/v1/player?key=AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+            "https://www.youtube.com/youtubei/v1/player",
             headers = mapOf(
                 "Content-Type" to "application/json",
-                "User-Agent" to "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+                "User-Agent" to "com.google.android.youtube/$clientVersion (Linux; U; Android 11) gzip",
                 "X-YouTube-Client-Name" to "3",
-                "X-YouTube-Client-Version" to "19.09.37"
+                "X-YouTube-Client-Version" to clientVersion,
+                "Origin" to "https://www.youtube.com"
             ),
             requestBody = body.toRequestBody("application/json".toMediaTypeOrNull())
         )
@@ -380,7 +381,12 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
             Log.e("YouTubeProvider", "InnerTube HTTP ${response.code} for $videoId")
             return false
         }
-        val json = response.parsedSafe<InnerTubePlayerResponse>() ?: return false
+        val json = try {
+            parseJson<YtPlayerResponse>(response.text)
+        } catch (e: Exception) {
+            Log.e("YouTubeProvider", "InnerTube parse error: ${e.message}")
+            return false
+        }
         val status = json.playabilityStatus?.status
         if (status != "OK") {
             Log.e("YouTubeProvider", "InnerTube playability=$status for $videoId")
@@ -454,21 +460,22 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
         return false
     }
 
-    // InnerTube response data classes
-    data class InnerTubePlayerResponse(
-        val playabilityStatus: PlayabilityStatus? = null,
-        val streamingData: StreamingData? = null
-    )
-    data class PlayabilityStatus(val status: String? = null)
-    data class StreamingData(
-        val formats: List<Format>? = null,
-        val adaptiveFormats: List<Format>? = null
-    )
-    data class Format(
-        val url: String? = null,
-        val mimeType: String? = null,
-        val width: Int? = null,
-        val height: Int? = null,
-        val bitrate: Int? = null
-    )
 }
+
+// Top-level data classes for YouTube InnerTube API (distinct names to avoid clashing with CloudStream's YoutubeExtractor)
+data class YtPlayerResponse(
+    val playabilityStatus: YtPlayabilityStatus? = null,
+    val streamingData: YtStreamingData? = null
+)
+data class YtPlayabilityStatus(val status: String? = null)
+data class YtStreamingData(
+    val formats: List<YtFormat>? = null,
+    val adaptiveFormats: List<YtFormat>? = null
+)
+data class YtFormat(
+    val url: String? = null,
+    val mimeType: String? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    val bitrate: Int? = null
+)
