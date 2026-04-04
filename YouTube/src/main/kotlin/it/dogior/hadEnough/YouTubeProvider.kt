@@ -358,78 +358,77 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
 
         var found = false
 
-        // HLS (live streams) — highest priority
-        if (videoInfo.hlsUrl.isNotEmpty()) {
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name = "$name Live",
-                    url = videoInfo.hlsUrl,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = MAIN_URL
-                    this.quality = -1
-                }
-            )
-            found = true
+        // HLS manifest (live streams)
+        try {
+            val hls = videoInfo.hlsUrl
+            if (!hls.isNullOrEmpty()) {
+                callback(newExtractorLink(source = name, name = "$name Live", url = hls, type = ExtractorLinkType.M3U8) {
+                    this.referer = MAIN_URL; this.quality = -1
+                })
+                found = true
+            }
+        } catch (e: Exception) {
+            Log.e("YouTubeProvider", "HLS error: ${e.message}")
         }
 
-        // Progressive streams (video + audio combined) — best compatibility
-        for (stream in videoInfo.videoStreams) {
-            val url = stream.content ?: continue
-            if (url.isEmpty()) continue
-            val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name = "$name ${stream.resolution}",
-                    url = url,
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = MAIN_URL
-                    this.quality = quality
-                }
-            )
-            found = true
+        // DASH manifest (most reliable for YouTube VOD)
+        try {
+            val dash = videoInfo.dashMpdUrl
+            if (!dash.isNullOrEmpty()) {
+                callback(newExtractorLink(source = name, name = "$name DASH", url = dash, type = ExtractorLinkType.DASH) {
+                    this.referer = MAIN_URL; this.quality = -1
+                })
+                found = true
+            }
+        } catch (e: Exception) {
+            Log.e("YouTubeProvider", "DASH error: ${e.message}")
         }
 
-        // Adaptive video-only streams (DASH) — YouTube serves most HD as adaptive
-        for (stream in videoInfo.videoOnlyStreams) {
-            val url = stream.content ?: continue
-            if (url.isEmpty()) continue
-            val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name = "$name ${stream.resolution} (video)",
-                    url = url,
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = MAIN_URL
-                    this.quality = quality
-                }
-            )
-            found = true
+        // Progressive streams (video + audio combined, typically ≤720p)
+        try {
+            for (stream in videoInfo.videoStreams) {
+                val url = try { stream.content } catch (e: Exception) { null } ?: continue
+                if (url.isEmpty()) continue
+                val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
+                callback(newExtractorLink(source = name, name = "$name ${stream.resolution}", url = url, type = ExtractorLinkType.VIDEO) {
+                    this.referer = MAIN_URL; this.quality = quality
+                })
+                found = true
+            }
+        } catch (e: Exception) {
+            Log.e("YouTubeProvider", "videoStreams error: ${e.message}")
         }
 
-        // Audio-only streams — fallback for audio content
-        for (stream in videoInfo.audioStreams) {
-            val url = stream.content ?: continue
-            if (url.isEmpty()) continue
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name = "$name Audio ${stream.averageBitrate}kbps",
-                    url = url,
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = MAIN_URL
-                    this.quality = -1
-                }
-            )
-            found = true
+        // Adaptive video-only streams (HD, no audio)
+        try {
+            for (stream in videoInfo.videoOnlyStreams) {
+                val url = try { stream.content } catch (e: Exception) { null } ?: continue
+                if (url.isEmpty()) continue
+                val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
+                callback(newExtractorLink(source = name, name = "$name ${stream.resolution} (video)", url = url, type = ExtractorLinkType.VIDEO) {
+                    this.referer = MAIN_URL; this.quality = quality
+                })
+                found = true
+            }
+        } catch (e: Exception) {
+            Log.e("YouTubeProvider", "videoOnlyStreams error: ${e.message}")
         }
 
+        // Audio-only streams
+        try {
+            for (stream in videoInfo.audioStreams) {
+                val url = try { stream.content } catch (e: Exception) { null } ?: continue
+                if (url.isEmpty()) continue
+                callback(newExtractorLink(source = name, name = "$name Audio", url = url, type = ExtractorLinkType.VIDEO) {
+                    this.referer = MAIN_URL; this.quality = -1
+                })
+                found = true
+            }
+        } catch (e: Exception) {
+            Log.e("YouTubeProvider", "audioStreams error: ${e.message}")
+        }
+
+        Log.d("YouTubeProvider", "loadLinks found=$found for $data")
         return found
     }
 }
