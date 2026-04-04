@@ -4,6 +4,7 @@ import android.content.SharedPreferences
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.Actor
 import com.lagradost.cloudstream3.ActorData
+import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -12,6 +13,7 @@ import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -21,6 +23,7 @@ import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newSearchResponseList
+import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import org.schabi.newpipe.extractor.InfoItem
 import org.schabi.newpipe.extractor.InfoItem.InfoType
@@ -270,6 +273,63 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
     }
 
     override suspend fun load(url: String): LoadResponse {
+        val isChannel = url.contains("/@") || url.contains("/channel/") || url.contains("/c/")
+        val isPlaylist = url.contains("/playlist?")
+
+        if (isChannel) {
+            val channelInfo = ChannelInfo.getInfo(url)
+            val tabsLinkHandlers = channelInfo.tabs
+            val tabs = tabsLinkHandlers.map { ChannelTabInfo.getInfo(service, it) }
+            val videoTab = tabs.firstOrNull { it.name == "videos" }
+            val videos: List<Episode> = videoTab?.relatedItems?.mapNotNull {
+                newEpisode(it.url) {
+                    this.name = it.name
+                    this.posterUrl = it.thumbnails.lastOrNull()?.url
+                }
+            }?.reversed() ?: emptyList()
+            val avatarUrl = try { channelInfo.avatars.last().url } catch (_: Exception) { null }
+            val bannerUrl = try { channelInfo.banners.last().url } catch (_: Exception) { null }
+            return newTvSeriesLoadResponse(channelInfo.name, url, TvType.Others, videos) {
+                this.posterUrl = avatarUrl
+                this.backgroundPosterUrl = bannerUrl
+                this.plot = channelInfo.description
+                this.tags = listOf("Subscribers: ${formatThousands(channelInfo.subscriberCount)}")
+            }
+        }
+
+        if (isPlaylist) {
+            val playlistInfo = PlaylistInfo.getInfo(url)
+            val banner = if (playlistInfo.banners.isNotEmpty()) playlistInfo.banners.last().url
+                         else playlistInfo.thumbnails.lastOrNull()?.url
+            val eps = playlistInfo.relatedItems.toMutableList()
+            var hasNext = playlistInfo.hasNextPage()
+            var count = 1
+            var nextPage = playlistInfo.nextPage
+            while (hasNext && count < 10) {
+                val more = PlaylistInfo.getMoreItems(service, url, nextPage)
+                eps.addAll(more.items)
+                hasNext = more.hasNextPage()
+                nextPage = more.nextPage
+                count++
+            }
+            val episodes = eps.map { video ->
+                newEpisode(video.url) {
+                    this.name = video.name
+                    this.posterUrl = video.thumbnails.lastOrNull()?.url
+                    this.runTime = (video.duration / 60).toInt()
+                }
+            }
+            return newTvSeriesLoadResponse(playlistInfo.name, url, TvType.Others, episodes) {
+                this.posterUrl = playlistInfo.thumbnails.lastOrNull()?.url
+                this.backgroundPosterUrl = banner
+                this.plot = playlistInfo.description.content
+                this.actors = listOf(ActorData(
+                    Actor(playlistInfo.uploaderName, playlistInfo.uploaderAvatars.lastOrNull()?.url)
+                ))
+            }
+        }
+
+        // Default: treat as video
         val extractor = service.getStreamExtractor(url)
         extractor.fetchPage()
         val videoInfo = StreamInfo.getInfo(extractor)
@@ -277,7 +337,7 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
         val likes = "👍: ${formatThousands(videoInfo.likeCount)}"
         val length = videoInfo.duration / 60
         return newMovieLoadResponse(videoInfo.name, url, TvType.Others, url) {
-            this.posterUrl = videoInfo.thumbnails.last().url
+            this.posterUrl = videoInfo.thumbnails.lastOrNull()?.url
             this.plot = videoInfo.description.content
             this.duration = length.toInt()
             this.tags = listOf(views, likes)
