@@ -358,14 +358,32 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
 
         var found = false
 
-        // Progressive streams (video + audio combined)
+        // HLS (live streams) — highest priority
+        if (videoInfo.hlsUrl.isNotEmpty()) {
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = "$name Live",
+                    url = videoInfo.hlsUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = MAIN_URL
+                    this.quality = -1
+                }
+            )
+            found = true
+        }
+
+        // Progressive streams (video + audio combined) — best compatibility
         for (stream in videoInfo.videoStreams) {
+            val url = stream.content ?: continue
+            if (url.isEmpty()) continue
             val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
             callback(
                 newExtractorLink(
                     source = name,
                     name = "$name ${stream.resolution}",
-                    url = stream.content,
+                    url = url,
                     type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = MAIN_URL
@@ -375,14 +393,35 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
             found = true
         }
 
-        // HLS (live streams)
-        if (videoInfo.hlsUrl.isNotEmpty()) {
+        // Adaptive video-only streams (DASH) — YouTube serves most HD as adaptive
+        for (stream in videoInfo.videoOnlyStreams) {
+            val url = stream.content ?: continue
+            if (url.isEmpty()) continue
+            val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
             callback(
                 newExtractorLink(
                     source = name,
-                    name = "$name Live",
-                    url = videoInfo.hlsUrl,
-                    type = ExtractorLinkType.M3U8
+                    name = "$name ${stream.resolution} (video)",
+                    url = url,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = MAIN_URL
+                    this.quality = quality
+                }
+            )
+            found = true
+        }
+
+        // Audio-only streams — fallback for audio content
+        for (stream in videoInfo.audioStreams) {
+            val url = stream.content ?: continue
+            if (url.isEmpty()) continue
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = "$name Audio ${stream.averageBitrate}kbps",
+                    url = url,
+                    type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = MAIN_URL
                     this.quality = -1
