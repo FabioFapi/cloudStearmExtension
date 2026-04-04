@@ -25,14 +25,15 @@ import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newSearchResponseList
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
-import kotlinx.coroutines.delay
+import com.lagradost.cloudstream3.app
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.schabi.newpipe.extractor.InfoItem
 import org.schabi.newpipe.extractor.InfoItem.InfoType
 import org.schabi.newpipe.extractor.Page
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.channel.ChannelInfo
 import org.schabi.newpipe.extractor.channel.tabs.ChannelTabInfo
-import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException
 import org.schabi.newpipe.extractor.kiosk.KioskInfo
 import org.schabi.newpipe.extractor.linkhandler.SearchQueryHandler
 import org.schabi.newpipe.extractor.playlist.PlaylistInfo
@@ -348,20 +349,64 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
         }
     }
 
-    private suspend fun fetchStreamInfo(url: String): StreamInfo {
-        var lastException: Exception? = null
-        repeat(3) { attempt ->
-            try {
-                val extractor = service.getStreamExtractor(url)
-                extractor.fetchPage()
-                return StreamInfo.getInfo(extractor)
-            } catch (e: ContentNotAvailableException) {
-                Log.w("YouTubeProvider", "fetchStreamInfo attempt ${attempt + 1} failed: ${e.message}")
-                lastException = e
-                delay(1500L * (attempt + 1))
-            }
+    private fun extractVideoId(url: String): String? {
+        // https://www.youtube.com/watch?v=XXXXX or https://youtu.be/XXXXX
+        val patterns = listOf(
+            Regex("[?&]v=([a-zA-Z0-9_-]{11})"),
+            Regex("youtu\\.be/([a-zA-Z0-9_-]{11})"),
+            Regex("shorts/([a-zA-Z0-9_-]{11})")
+        )
+        for (pattern in patterns) {
+            val match = pattern.find(url)
+            if (match != null) return match.groupValues[1]
         }
-        throw lastException ?: Exception("Failed to fetch stream info for $url")
+        return null
+    }
+
+    private suspend fun loadLinksViaInnerTube(videoId: String, callback: (ExtractorLink) -> Unit): Boolean {
+        // Android client — not blocked by YouTube's bot detection
+        val body = """{"context":{"client":{"clientName":"ANDROID","clientVersion":"19.09.37","androidSdkVersion":30,"hl":"en","gl":"US"}},"videoId":"$videoId","params":"2AMB"}"""
+        val response = app.post(
+            "https://www.youtube.com/youtubei/v1/player?key=AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+            headers = mapOf(
+                "Content-Type" to "application/json",
+                "User-Agent" to "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+                "X-YouTube-Client-Name" to "3",
+                "X-YouTube-Client-Version" to "19.09.37"
+            ),
+            requestBody = body.toRequestBody("application/json".toMediaTypeOrNull())
+        )
+        if (!response.isSuccessful) {
+            Log.e("YouTubeProvider", "InnerTube HTTP ${response.code} for $videoId")
+            return false
+        }
+        val json = response.parsedSafe<InnerTubePlayerResponse>() ?: return false
+        val status = json.playabilityStatus?.status
+        if (status != "OK") {
+            Log.e("YouTubeProvider", "InnerTube playability=$status for $videoId")
+            return false
+        }
+        var found = false
+        val formats = (json.streamingData?.formats ?: emptyList()) +
+                      (json.streamingData?.adaptiveFormats ?: emptyList())
+        for (fmt in formats) {
+            val url = fmt.url ?: continue
+            if (url.isEmpty()) continue
+            val quality = fmt.height ?: -1
+            val mimeType = fmt.mimeType ?: ""
+            val isAudioOnly = mimeType.startsWith("audio/")
+            val label = when {
+                isAudioOnly -> "$name Audio"
+                quality > 0 -> "$name ${quality}p"
+                else -> name
+            }
+            callback(newExtractorLink(source = name, name = label, url = url, type = ExtractorLinkType.VIDEO) {
+                this.referer = MAIN_URL
+                this.quality = quality
+            })
+            found = true
+        }
+        return found
     }
 
     override suspend fun loadLinks(
@@ -370,12 +415,22 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val videoInfo = fetchStreamInfo(data)
+        val videoId = extractVideoId(data)
+        if (videoId != null) {
+            try {
+                val found = loadLinksViaInnerTube(videoId, callback)
+                if (found) return true
+            } catch (e: Exception) {
+                Log.e("YouTubeProvider", "InnerTube failed: ${e.message}")
+            }
+        }
 
-        var found = false
-
-        // HLS manifest (live streams)
+        // Fallback: NewPipe extraction
         try {
+            val extractor = service.getStreamExtractor(data)
+            extractor.fetchPage()
+            val videoInfo = StreamInfo.getInfo(extractor)
+            var found = false
             val hls = videoInfo.hlsUrl
             if (!hls.isNullOrEmpty()) {
                 callback(newExtractorLink(source = name, name = "$name Live", url = hls, type = ExtractorLinkType.M3U8) {
@@ -383,26 +438,7 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
                 })
                 found = true
             }
-        } catch (e: Exception) {
-            Log.e("YouTubeProvider", "HLS error: ${e.message}")
-        }
-
-        // DASH manifest (most reliable for YouTube VOD)
-        try {
-            val dash = videoInfo.dashMpdUrl
-            if (!dash.isNullOrEmpty()) {
-                callback(newExtractorLink(source = name, name = "$name DASH", url = dash, type = ExtractorLinkType.DASH) {
-                    this.referer = MAIN_URL; this.quality = -1
-                })
-                found = true
-            }
-        } catch (e: Exception) {
-            Log.e("YouTubeProvider", "DASH error: ${e.message}")
-        }
-
-        // Progressive streams (video + audio combined, typically ≤720p)
-        try {
-            for (stream in videoInfo.videoStreams) {
+            for (stream in videoInfo.videoStreams + videoInfo.videoOnlyStreams) {
                 val url = try { stream.content } catch (e: Exception) { null } ?: continue
                 if (url.isEmpty()) continue
                 val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
@@ -411,40 +447,28 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
                 })
                 found = true
             }
+            return found
         } catch (e: Exception) {
-            Log.e("YouTubeProvider", "videoStreams error: ${e.message}")
+            Log.e("YouTubeProvider", "NewPipe fallback failed: ${e.message}")
         }
-
-        // Adaptive video-only streams (HD, no audio)
-        try {
-            for (stream in videoInfo.videoOnlyStreams) {
-                val url = try { stream.content } catch (e: Exception) { null } ?: continue
-                if (url.isEmpty()) continue
-                val quality = stream.resolution.replace("p", "").toIntOrNull() ?: -1
-                callback(newExtractorLink(source = name, name = "$name ${stream.resolution} (video)", url = url, type = ExtractorLinkType.VIDEO) {
-                    this.referer = MAIN_URL; this.quality = quality
-                })
-                found = true
-            }
-        } catch (e: Exception) {
-            Log.e("YouTubeProvider", "videoOnlyStreams error: ${e.message}")
-        }
-
-        // Audio-only streams
-        try {
-            for (stream in videoInfo.audioStreams) {
-                val url = try { stream.content } catch (e: Exception) { null } ?: continue
-                if (url.isEmpty()) continue
-                callback(newExtractorLink(source = name, name = "$name Audio", url = url, type = ExtractorLinkType.VIDEO) {
-                    this.referer = MAIN_URL; this.quality = -1
-                })
-                found = true
-            }
-        } catch (e: Exception) {
-            Log.e("YouTubeProvider", "audioStreams error: ${e.message}")
-        }
-
-        Log.d("YouTubeProvider", "loadLinks found=$found for $data")
-        return found
+        return false
     }
+
+    // InnerTube response data classes
+    data class InnerTubePlayerResponse(
+        val playabilityStatus: PlayabilityStatus? = null,
+        val streamingData: StreamingData? = null
+    )
+    data class PlayabilityStatus(val status: String? = null)
+    data class StreamingData(
+        val formats: List<Format>? = null,
+        val adaptiveFormats: List<Format>? = null
+    )
+    data class Format(
+        val url: String? = null,
+        val mimeType: String? = null,
+        val width: Int? = null,
+        val height: Int? = null,
+        val bitrate: Int? = null
+    )
 }
