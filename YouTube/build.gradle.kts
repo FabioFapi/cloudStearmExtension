@@ -1,5 +1,5 @@
 // use an integer for version numbers
-version = 19
+version = 20
 
 cloudstream {
     description = "Videos, playlists and channels from YouTube"
@@ -30,5 +30,5 @@ android {
 
 dependencies {
     implementation("com.google.android.material:material:1.12.0")
-    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.0")
+    implementation("com.github.teamnewpipe:NewPipeExtractor:dev-SNAPSHOT")
 }

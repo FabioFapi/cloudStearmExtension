@@ -25,12 +25,14 @@ import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newSearchResponseList
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
+import kotlinx.coroutines.delay
 import org.schabi.newpipe.extractor.InfoItem
 import org.schabi.newpipe.extractor.InfoItem.InfoType
 import org.schabi.newpipe.extractor.Page
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.channel.ChannelInfo
 import org.schabi.newpipe.extractor.channel.tabs.ChannelTabInfo
+import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException
 import org.schabi.newpipe.extractor.kiosk.KioskInfo
 import org.schabi.newpipe.extractor.linkhandler.SearchQueryHandler
 import org.schabi.newpipe.extractor.playlist.PlaylistInfo
@@ -346,15 +348,29 @@ open class YouTubeProvider(language: String, private val sharedPrefs: SharedPref
         }
     }
 
+    private suspend fun fetchStreamInfo(url: String): StreamInfo {
+        var lastException: Exception? = null
+        repeat(3) { attempt ->
+            try {
+                val extractor = service.getStreamExtractor(url)
+                extractor.fetchPage()
+                return StreamInfo.getInfo(extractor)
+            } catch (e: ContentNotAvailableException) {
+                Log.w("YouTubeProvider", "fetchStreamInfo attempt ${attempt + 1} failed: ${e.message}")
+                lastException = e
+                delay(1500L * (attempt + 1))
+            }
+        }
+        throw lastException ?: Exception("Failed to fetch stream info for $url")
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val extractor = service.getStreamExtractor(data)
-        extractor.fetchPage()
-        val videoInfo = StreamInfo.getInfo(extractor)
+        val videoInfo = fetchStreamInfo(data)
 
         var found = false
 
